@@ -26,3 +26,5 @@ node_modules
 CMakeSettings.json
 xcuserdata/
 agent.toml
+diff_review_post_commit_log.txt
+diff_review_post_commit.md
