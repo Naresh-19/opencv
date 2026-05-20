@@ -149,6 +149,11 @@ inline int onnxDataTypeToCV(OnnxDataType dt)
 void reshapeAndCopyFirst(InputArrayOfArrays inputs,
                          OutputArrayOfArrays outputs,
                          const MatShape& shape);
+
+void transformLayout(const Mat& inp, Mat& out,
+                     DataLayout outlayout,
+                     DataLayout defaultLayout,
+                     int C0);
 }
 }
 
