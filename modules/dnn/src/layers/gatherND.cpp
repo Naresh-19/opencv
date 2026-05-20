@@ -162,9 +162,6 @@ public:
                     offset += sliced_indices[j] * data_strides[batch_dims + j];
                 }
 
-                if (batch_dims > 0)
-                    offset += data_strides[batch_dims - 1] * i;
-
                 // copy data from data to out
                 for (size_t j = 0; j < inner_size; ++j)
                 {

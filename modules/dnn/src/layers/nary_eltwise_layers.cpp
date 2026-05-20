@@ -283,6 +283,7 @@ public:
         CV_Assert(ninputs > 0u);
 
         int C0 = shapes[0].C, dims0 = shapes[0].dims, maxdims = dims0;
+        int maxC = C0;
         bool constC = true;
         bool allBlock = true;
         bool constDims = true;
@@ -293,12 +294,19 @@ public:
             constC = constC && inpShape.C == C0;
             constDims = constDims && dims == dims0;
             maxdims = std::max(maxdims, dims);
+            maxC = std::max(maxC, inpShape.C);
         }
 
         MatShape outShape(maxdims, 1);
         if (allBlock && constC && constDims) {
             outShape.layout = DATA_LAYOUT_BLOCK;
             outShape.C = C0;
+        } else if (allBlock && !constC && constDims) {
+            // BLOCK inputs with broadcast-singleton C: the output Mat is still
+            // physically BLOCK; tag it as such so downstream layers route to
+            // the BLOCK path instead of NCHW.
+            outShape.layout = DATA_LAYOUT_BLOCK;
+            outShape.C = maxC;
         }
 
         for (i = 0; i < ninputs; i++)
@@ -885,6 +893,103 @@ public:
         }
     }
 
+    // BLOCK inputs with mismatched C cannot be broadcast in packed form;
+    // forward path must demote to NCHW.
+    static bool needsBlockBroadcastDemote(const std::vector<Mat>& inputs)
+    {
+        int blockC = -1;
+        for (const Mat& m : inputs)
+        {
+            if (m.size.layout == DATA_LAYOUT_BLOCK)
+            {
+                if (blockC < 0)
+                    blockC = m.size.C;
+                else if (blockC != m.size.C)
+                    return true;
+            }
+            else if (blockC >= 0)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void forwardBlockBroadcastDemoted(const std::vector<Mat>& inputs,
+                                      std::vector<Mat>& outputs)
+    {
+        Net::Impl* netimpl_ = getNetImpl(this);
+        DataLayout defLayout = netimpl_ ? netimpl_->originalLayout : DATA_LAYOUT_NCHW;
+
+        int blockDims = -1;
+        for (const Mat& m : inputs)
+        {
+            if (m.size.layout == DATA_LAYOUT_BLOCK)
+            {
+                blockDims = m.size.dims;
+                break;
+            }
+        }
+        const bool outIsBlock = !outputs.empty() && blockDims > 0 &&
+                                outputs[0].size.dims == blockDims;
+
+        std::vector<Mat> demoted(inputs.size());
+        for (size_t i = 0; i < inputs.size(); ++i)
+        {
+            if (inputs[i].size.layout == DATA_LAYOUT_BLOCK)
+                transformLayout(inputs[i], demoted[i], defLayout, defLayout, 0);
+            else
+                demoted[i] = inputs[i];
+        }
+
+        Mat plain_out;
+        if (outIsBlock)
+        {
+            const MatShape& bs = outputs[0].size;
+            int C0 = bs[bs.dims - 1];
+            MatShape outSemantic(bs.dims - 1);
+            outSemantic[0] = bs[0];
+            outSemantic[1] = bs[1] * C0;
+            for (int k = 2; k < bs.dims - 1; ++k)
+                outSemantic[k] = bs[k];
+            outSemantic.layout = defLayout;
+            plain_out.fit(outSemantic, outputs[0].type());
+        }
+        else
+        {
+            plain_out = outputs[0];
+        }
+
+        std::vector<Mat> plain_outs{plain_out};
+        helper.init(demoted, plain_outs);
+        CV_CheckTrue(helper.prepare_for_broadcast_op(),
+                     "NaryEltwiseLayer: Preparation for broadcasting failed (demoted path)");
+        int dispatch_type = (op == OPERATION::WHERE || op == OPERATION::POW)
+                            ? plain_outs.front().type()
+                            : demoted.front().type();
+        typeDispatch(dispatch_type, demoted.size(), demoted, plain_outs);
+
+        if (outIsBlock)
+        {
+            // Pack into a temp BLOCK Mat first; outputs[0].fit() could otherwise
+            // reallocate and detach the Mat from its buffer-pool slot.
+            int C0 = outputs[0].size.back();
+            Mat block_repacked;
+            transformLayout(plain_outs[0], block_repacked, DATA_LAYOUT_BLOCK, defLayout, C0);
+            CV_Assert(block_repacked.isContinuous() && outputs[0].isContinuous());
+            CV_Assert(block_repacked.total() * block_repacked.elemSize() ==
+                      outputs[0].total() * outputs[0].elemSize());
+            std::memcpy(outputs[0].data, block_repacked.data,
+                        block_repacked.total() * block_repacked.elemSize());
+        }
+        else if (plain_outs[0].data != outputs[0].data)
+        {
+            CV_Assert(plain_outs[0].total() == outputs[0].total());
+            std::memcpy(outputs[0].data, plain_outs[0].data,
+                        plain_outs[0].total() * plain_outs[0].elemSize());
+        }
+    }
+
     void forward(InputArrayOfArrays inputs_arr, OutputArrayOfArrays outputs_arr, OutputArrayOfArrays internals_arr) CV_OVERRIDE
     {
         CV_TRACE_FUNCTION();
@@ -902,6 +1007,12 @@ public:
 
         if (inputs.size() == 1) {
             inputs[0].copyTo(outputs[0]);
+            return;
+        }
+
+        if (needsBlockBroadcastDemote(inputs))
+        {
+            forwardBlockBroadcastDemoted(inputs, outputs);
             return;
         }
 
