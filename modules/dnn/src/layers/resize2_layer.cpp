@@ -175,9 +175,12 @@ static inline void buildBilinearIndexAndLerp(std::vector<int>& i0,
         }
         else
         {
-            src = std::min(std::max(src, 0.f), float(inLen - 1) - 1e-6f);
+            // For inLen == 1, float(inLen-1) - 1e-6 is negative; floor() returns -1
+            // and i0 escapes the input bounds. Clamp both upper and i0.
+            float upper = std::max(0.f, float(inLen - 1) - 1e-6f);
+            src = std::min(std::max(src, 0.f), upper);
             int base = int(std::floor(src));
-            i0[o] = base;
+            i0[o] = clamp(base, 0, inLen - 1);
             i1[o] = clamp(base + 1, 0, inLen - 1);
             frac[o] = src - float(base);
         }
